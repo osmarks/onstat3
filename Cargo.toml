@@ -15,3 +15,6 @@ fnv = "1"
 int-enum = "0.5"
 maud = "0.25"
 png = "0.17"
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+futures = "*"
