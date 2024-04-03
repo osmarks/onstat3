@@ -232,13 +232,11 @@ fn render_site(site: Site) -> Markup {
         for percentile in percentiles.iter().copied() {
             if percentile >= bucket_start_perc && percentile < bucket_end_perc {
                 let ithresh = (percentile - bucket_start_perc) / (bucket_end_perc - bucket_start_perc);
-                println!("{}", ithresh);
                 let ival = bucket_max / site.histogram.exp.powf(1.0 - ithresh);
                 percentile_values.push((percentile, ithresh + i as f64, ival));
             }
         }
     }
-    println!("{:?}", percentile_values);
     let max_count = *buckets.iter().map(|(_i, x)| x).max().unwrap();
     let bar_width = width / buckets.len() as f64;
     let plot = html! {
@@ -474,10 +472,6 @@ async fn write_site<'a, E: SqliteExecutor<'a>>(conn: E, data: Site) -> Result<()
 }
 
 async fn handler(State(AppState { live_histograms, pool, sites: site_urls, images: _ }): State<AppState>) -> Result<Html<String>, AppError> {
-    let histograms = live_histograms;
-    for (id, histo) in histograms.iter() {
-        println!("{} {:?}", id, histo.read().await);
-    }
     let mut conn = pool.acquire().await?;
     let mut sites = vec![];
     let mut sites_up = 0;
