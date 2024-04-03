@@ -301,6 +301,7 @@ async fn main() -> Result<()> {
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(9999))
         .connect_with(
             SqliteConnectOptions::from_str("sqlite://./onstat.sqlite3")?
                 .journal_mode(SqliteJournalMode::Wal)
