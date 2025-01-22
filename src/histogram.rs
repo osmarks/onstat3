@@ -20,7 +20,7 @@ impl Histogram {
 
     pub fn dec(&mut self, x: f64) {
         let b = self.bucket_for(x);
-        self.data[b] += 1;
+        self.data[b] -= 1;
     }
 
     pub fn new(min: f64, max: f64, exp: f64) -> Self {

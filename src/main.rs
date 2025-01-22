@@ -190,7 +190,7 @@ async fn do_requests(state: AppState) {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Site {
     url: String,
     successful_requests: u64,
@@ -204,7 +204,7 @@ struct Site {
 }
 
 fn render_site(site: Site) -> Markup {
-    let latency_us = site.total_latency_us / (site.successful_requests as u128);
+    let latency_us = if site.successful_requests > 0 { site.total_latency_us / (site.successful_requests as u128) } else { 0 };
     let perc_up = (site.successful_requests as f64) / (site.requests as f64);
     let latency_ms = latency_us / 1000;
     let (status_class, status_icon, status_text) = match site.last_status {
@@ -297,6 +297,8 @@ fn blank_histogram() -> Histogram {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
+
     let sites: Arc<[String]> = std::env::args().skip(1).collect();
 
     let pool = SqlitePoolOptions::new()
@@ -309,7 +311,6 @@ async fn main() -> Result<()> {
                 .create_if_missing(true)).await?;
     let pool = Arc::new(pool);
 
-    println!("{:?}", sites);
     let sites_ = sites.clone();
     let images = Arc::new(RwLock::new(HashMap::new()));
     let mut live_histograms = HashMap::new();
@@ -334,7 +335,8 @@ async fn main() -> Result<()> {
         status INTEGER NOT NULL,
         latency_us INTEGER NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS req_ts_idx ON req (timestamp);").await?;
+    CREATE INDEX IF NOT EXISTS req_ts_idx ON req (timestamp);
+    CREATE INDEX IF NOT EXISTS req_ts_idx2 ON req (site, timestamp);").await?;
 
     for site in sites.iter() {
         let id = site_to_id(site);
@@ -391,7 +393,6 @@ async fn main() -> Result<()> {
         .with_state(app_state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 7800));
-    println!("listening on {}", addr);
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await?;
