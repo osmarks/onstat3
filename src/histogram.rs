@@ -1,6 +1,4 @@
-use serde::{Serialize, Deserialize};
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct Histogram {
     data: Vec<u64>,
     pub min: f64,
