@@ -1,20 +1,34 @@
-use axum::{response::{Html, IntoResponse, Response}, routing::get, Router, extract::{State, Path}, body::Bytes, http::StatusCode};
-use maud::{html, Markup, PreEscaped, DOCTYPE};
-use std::{net::SocketAddr, collections::HashMap};
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use sqlx::{Row, Sqlite, sqlite::{SqlitePoolOptions, SqliteConnectOptions, SqliteJournalMode}, Executor, Acquire, SqlitePool, pool::PoolConnection, SqliteExecutor};
 use anyhow::Result;
-use std::str::FromStr;
+use axum::{
+    body::Bytes,
+    extract::{Path, State},
+    http::StatusCode,
+    response::{Html, IntoResponse, Response},
+    routing::get,
+    Router,
+};
 use fnv::FnvHasher;
-use int_enum::IntEnum;
-use std::hash::{Hash, Hasher};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use tokio::time::{interval, MissedTickBehavior};
-use std::collections::VecDeque;
-use serde::{Serialize, Deserialize};
 use futures::TryStreamExt;
 use histogram::Histogram;
+use int_enum::IntEnum;
+use maud::{html, Markup, PreEscaped, DOCTYPE};
+use serde::{Deserialize, Serialize};
+use sqlx::{
+    pool::PoolConnection,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    Acquire, Executor, Row, Sqlite, SqliteExecutor, SqlitePool,
+};
+use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+};
+use tokio::sync::RwLock;
+use tokio::time::{interval, MissedTickBehavior};
 
 mod histogram;
 
@@ -24,7 +38,7 @@ enum Status {
     Ok = 0,
     HttpError = 1,
     Timeout = 2,
-    FetchError = 3
+    FetchError = 3,
 }
 
 fn site_to_id(s: &str) -> u32 {
@@ -41,10 +55,23 @@ const HISTORY_IMAGE_WIDTH: u32 = 120 * 6;
 const HISTORY_IMAGE_HEIGHT: u32 = 168 * 2;
 
 fn get_rolling_threshold(now: SystemTime) -> i64 {
-    now.checked_sub(ROLLING_LEN).unwrap().duration_since(UNIX_EPOCH).unwrap().as_micros().try_into().unwrap()
+    now.checked_sub(ROLLING_LEN)
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros()
+        .try_into()
+        .unwrap()
 }
 
-async fn push_new_request(mut conn: PoolConnection<Sqlite>, site: &str, now: SystemTime, status: Status, latency_us: u64, histogram: &RwLock<Histogram>) -> Result<()> {
+async fn push_new_request(
+    mut conn: PoolConnection<Sqlite>,
+    site: &str,
+    now: SystemTime,
+    status: Status,
+    latency_us: u64,
+    histogram: &RwLock<Histogram>,
+) -> Result<()> {
     let id = site_to_id(site);
     let mut site = read_site(&mut conn, id).await?;
     let threshold: i64 = get_rolling_threshold(now);
@@ -77,36 +104,119 @@ async fn push_new_request(mut conn: PoolConnection<Sqlite>, site: &str, now: Sys
         site.total_latency_sq_us += (latency_us as u128) * (latency_us as u128);
         histogram.inc(latency_us as f64);
     }
-    let timestamp: i64 = now.duration_since(UNIX_EPOCH).unwrap().as_micros().try_into().unwrap();
+    let timestamp: i64 = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros()
+        .try_into()
+        .unwrap();
     let mut tx = conn.begin().await?;
     site.histogram = histogram.clone();
     write_site(&mut tx, site).await?;
     sqlx::query("INSERT INTO req (site, timestamp, status, latency_us) VALUES (?, ?, ?, ?)")
-        .bind(id).bind(timestamp).bind(status.int_value()).bind(latency_us as i64)
+        .bind(id)
+        .bind(timestamp)
+        .bind(status.int_value())
+        .bind(latency_us as i64)
         .execute(&mut tx)
         .await?;
     tx.commit().await?;
     Ok(())
 }
 
-async fn do_request(pool: &SqlitePool, site: &str, histogram: &RwLock<Histogram>) -> Result<(Status, i64)> {
-    let client = reqwest::Client::builder().timeout(MAX_TIME).redirect(reqwest::redirect::Policy::none()).build().unwrap();
-    let start = SystemTime::now();
-    let status = match client.get(site)
-        .header("User-Agent", "onstat3")
-        .send()
-        .await {
-            Ok(res) if res.status().is_success() || res.status().is_redirection() => Status::Ok,
-            Ok(_res) => Status::HttpError,
-            Err(e) if e.is_status() => Status::HttpError,
-            Err(e) if e.is_timeout() => Status::Timeout,
-            Err(_) => Status::FetchError
-        };
-    let end = SystemTime::now();
-    let latency_us = end.duration_since(start).unwrap().as_micros().try_into().unwrap();
+async fn record_request(
+    pool: &SqlitePool,
+    site: &str,
+    histogram: &RwLock<Histogram>,
+    end: SystemTime,
+    status: Status,
+    latency_us: u64,
+) -> Result<(Status, i64)> {
     let conn = pool.acquire().await?;
     push_new_request(conn, site, end, status, latency_us, histogram).await?;
     Ok((status, latency_us as i64))
+}
+
+async fn do_request(
+    pool: &SqlitePool,
+    site: &str,
+    histogram: &RwLock<Histogram>,
+) -> Result<(Status, i64)> {
+    let url = match reqwest::Url::parse(site) {
+        Ok(url) => url,
+        Err(_) => {
+            return record_request(pool, site, histogram, SystemTime::now(), Status::FetchError, 0)
+                .await;
+        }
+    };
+    let host = match url.host_str() {
+        Some(host) => host,
+        None => {
+            return record_request(pool, site, histogram, SystemTime::now(), Status::FetchError, 0)
+                .await;
+        }
+    };
+    let port = match url.port_or_known_default() {
+        Some(port) => port,
+        None => {
+            return record_request(pool, site, histogram, SystemTime::now(), Status::FetchError, 0)
+                .await;
+        }
+    };
+    let host_for_lookup = host.trim_start_matches('[').trim_end_matches(']');
+    let resolved_addrs = if host_for_lookup.parse::<IpAddr>().is_ok() {
+        None
+    } else {
+        match tokio::net::lookup_host((host, port)).await {
+            Ok(addrs) => {
+                let addrs = addrs.collect::<Vec<_>>();
+                if addrs.is_empty() {
+                    return record_request(
+                        pool,
+                        site,
+                        histogram,
+                        SystemTime::now(),
+                        Status::FetchError,
+                        0,
+                    )
+                    .await;
+                }
+                Some(addrs)
+            }
+            Err(_) => {
+                return record_request(pool, site, histogram, SystemTime::now(), Status::FetchError, 0)
+                    .await;
+            }
+        }
+    };
+    let mut client = reqwest::Client::builder()
+        .timeout(MAX_TIME)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(resolved_addrs) = &resolved_addrs {
+        client = client.resolve_to_addrs(host, resolved_addrs);
+    }
+    let client = client.build().unwrap();
+    let start = SystemTime::now();
+    let status = match client
+        .get(site)
+        .header("User-Agent", "onstat3")
+        .send()
+        .await
+    {
+        Ok(res) if res.status().is_success() || res.status().is_redirection() => Status::Ok,
+        Ok(_res) => Status::HttpError,
+        Err(e) if e.is_status() => Status::HttpError,
+        Err(e) if e.is_timeout() => Status::Timeout,
+        Err(_) => Status::FetchError,
+    };
+    let end = SystemTime::now();
+    let latency_us = end
+        .duration_since(start)
+        .unwrap()
+        .as_micros()
+        .try_into()
+        .unwrap();
+    record_request(pool, site, histogram, end, status, latency_us).await
 }
 
 fn push_color(v: &mut VecDeque<u8>, (r, g, b): (u8, u8, u8)) {
@@ -120,7 +230,8 @@ pub const MAX_LATENCY: f64 = 15000000.0;
 
 fn scale_latency(latency_us: i64) -> f64 {
     let latency = latency_us as f64;
-    let raw_int = (latency.min(MAX_LATENCY).max(MIN_LATENCY).ln() - MIN_LATENCY.ln()) / (MAX_LATENCY.ln() - MIN_LATENCY.ln());
+    let raw_int = (latency.min(MAX_LATENCY).max(MIN_LATENCY).ln() - MIN_LATENCY.ln())
+        / (MAX_LATENCY.ln() - MIN_LATENCY.ln());
     raw_int * -0.8 + 1.0
 }
 
@@ -140,7 +251,7 @@ fn status_and_latency_to_color(status: Status, latency_us: i64) -> (u8, u8, u8) 
         Status::HttpError => (0xFF, 0x7F, 0),
         Status::Timeout => (0, 0, 0),
         Status::FetchError => (0xFF, 0, 0),
-        Status::Ok => (0, (255. * scale_latency(latency_us)) as u8, 0)
+        Status::Ok => (0, (255. * scale_latency(latency_us)) as u8, 0),
     }
 }
 
@@ -151,12 +262,18 @@ async fn do_requests(state: AppState) {
         let state = state.clone();
         let images = state.images.clone();
         tokio::spawn(async move {
-            let mut history_image_buffer: VecDeque<u8> = VecDeque::with_capacity(HISTORY_IMAGE_SAMPLES * 3);
+            let mut history_image_buffer: VecDeque<u8> =
+                VecDeque::with_capacity(HISTORY_IMAGE_SAMPLES * 3);
             for _ in 0..HISTORY_IMAGE_SAMPLES {
                 push_color(&mut history_image_buffer, (0x7E, 0x1E, 0x9C));
             }
             let history_end = SystemTime::now();
-            let history_start = history_end.checked_sub((HISTORY_IMAGE_SAMPLES as u32) * INTERVAL).unwrap().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
+            let history_start = history_end
+                .checked_sub((HISTORY_IMAGE_SAMPLES as u32) * INTERVAL)
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as i64;
             let history_end = history_end.duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
             let interval_us = INTERVAL.as_micros() as i64;
             let historical_latencies: Vec<(i64, u8, i64)> = sqlx::query("SELECT timestamp, status, latency_us FROM req WHERE site = ? AND timestamp > ? ORDER BY timestamp DESC")
@@ -165,13 +282,19 @@ async fn do_requests(state: AppState) {
                 .map(|row| (row.get(0), row.get(1), row.get(2)))
                 .fetch_all(&mut pool.acquire().await.unwrap()).await.unwrap();
             for (timestamp, status, latency_us) in historical_latencies {
-                let pix: usize = ((history_end - timestamp) / interval_us).try_into().unwrap();
-                let (r, g, b) = status_and_latency_to_color(Status::from_int(status).unwrap(), latency_us);
+                let pix: usize = ((history_end - timestamp) / interval_us)
+                    .try_into()
+                    .unwrap();
+                let (r, g, b) =
+                    status_and_latency_to_color(Status::from_int(status).unwrap(), latency_us);
                 history_image_buffer[3 * pix] = r;
                 history_image_buffer[3 * pix + 1] = g;
                 history_image_buffer[3 * pix + 2] = b;
             }
-            images.write().await.insert(site_to_id(&site), generate_image(&mut history_image_buffer));
+            images
+                .write()
+                .await
+                .insert(site_to_id(&site), generate_image(&mut history_image_buffer));
             let mut interval = interval(INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let histogram = &state.live_histograms[&site_to_id(&site)];
@@ -179,11 +302,19 @@ async fn do_requests(state: AppState) {
                 interval.tick().await;
                 match do_request(&*pool, &site, histogram).await {
                     Ok((status, latency_us)) => {
-                        for _ in 0..3 { history_image_buffer.pop_back(); }
-                        push_color(&mut history_image_buffer, status_and_latency_to_color(status, latency_us));
-                        images.write().await.insert(site_to_id(&site), generate_image(&mut history_image_buffer));
-                    },
-                    Err(e) => eprintln!("{} {:?}", site, e)
+                        for _ in 0..3 {
+                            history_image_buffer.pop_back();
+                        }
+                        push_color(
+                            &mut history_image_buffer,
+                            status_and_latency_to_color(status, latency_us),
+                        );
+                        images
+                            .write()
+                            .await
+                            .insert(site_to_id(&site), generate_image(&mut history_image_buffer));
+                    }
+                    Err(e) => eprintln!("{} {:?}", site, e),
                 }
             }
         });
@@ -200,18 +331,26 @@ struct Site {
     last_latency_us: u64,
     last_threshold: i64,
     last_status: Status,
-    histogram: Histogram
+    histogram: Histogram,
 }
 
 fn render_site(site: Site) -> Markup {
-    let latency_us = if site.successful_requests > 0 { site.total_latency_us / (site.successful_requests as u128) } else { 0 };
+    let latency_us = if site.successful_requests > 0 {
+        site.total_latency_us / (site.successful_requests as u128)
+    } else {
+        0
+    };
     let perc_up = (site.successful_requests as f64) / (site.requests as f64);
     let latency_ms = latency_us / 1000;
     let (status_class, status_icon, status_text) = match site.last_status {
-        Status::Ok => ("ok", "✓", format!("Latency {}ms", site.last_latency_us / 1000)),
+        Status::Ok => (
+            "ok",
+            "✓",
+            format!("Latency {}ms", site.last_latency_us / 1000),
+        ),
         Status::FetchError => ("fetch-error", "⚠", "HTTP error".to_string()),
         Status::HttpError => ("http-error", "✕", "Fetch failed".to_string()),
-        Status::Timeout => ("timeout", "✕", "Timed out".to_string())
+        Status::Timeout => ("timeout", "✕", "Timed out".to_string()),
     };
 
     let padding = 40.0;
@@ -220,7 +359,9 @@ fn render_site(site: Site) -> Markup {
     let buckets: Vec<(f64, u64)> = site.histogram.buckets().collect();
     let first_nonzero_index = buckets.iter().position(|(_, c)| *c != 0);
     let first_nonzero_index_r = buckets.iter().rposition(|(_, c)| *c != 0);
-    let buckets = buckets[first_nonzero_index.unwrap_or(0)..=first_nonzero_index_r.unwrap_or(buckets.len() - 1)].to_vec();
+    let buckets = buckets
+        [first_nonzero_index.unwrap_or(0)..=first_nonzero_index_r.unwrap_or(buckets.len() - 1)]
+        .to_vec();
     let percentiles = vec![0.5, 0.9, 0.99, 0.999];
     let mut percentile_values = vec![];
     let total: u64 = buckets.iter().map(|(_, c)| *c).sum();
@@ -231,7 +372,8 @@ fn render_site(site: Site) -> Markup {
         let bucket_end_perc = cumsum as f64 / total as f64;
         for percentile in percentiles.iter().copied() {
             if percentile >= bucket_start_perc && percentile < bucket_end_perc {
-                let ithresh = (percentile - bucket_start_perc) / (bucket_end_perc - bucket_start_perc);
+                let ithresh =
+                    (percentile - bucket_start_perc) / (bucket_end_perc - bucket_start_perc);
                 let ival = bucket_max / site.histogram.exp.powf(1.0 - ithresh);
                 percentile_values.push((percentile, ithresh + i as f64, ival));
             }
@@ -274,7 +416,7 @@ struct AppState {
     pool: Arc<SqlitePool>,
     sites: Arc<[String]>,
     images: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
-    live_histograms: Arc<HashMap<u32, RwLock<Histogram>>>
+    live_histograms: Arc<HashMap<u32, RwLock<Histogram>>>,
 }
 
 struct AppError(anyhow::Error);
@@ -285,7 +427,10 @@ impl IntoResponse for AppError {
     }
 }
 
-impl<E> From<E> for AppError where E: Into<anyhow::Error> {
+impl<E> From<E> for AppError
+where
+    E: Into<anyhow::Error>,
+{
     fn from(err: E) -> Self {
         Self(err.into())
     }
@@ -308,14 +453,17 @@ async fn main() -> Result<()> {
             SqliteConnectOptions::from_str("sqlite://./onstat.sqlite3")?
                 .journal_mode(SqliteJournalMode::Wal)
                 .busy_timeout(std::time::Duration::from_secs(9999))
-                .create_if_missing(true)).await?;
+                .create_if_missing(true),
+        )
+        .await?;
     let pool = Arc::new(pool);
 
     let sites_ = sites.clone();
     let images = Arc::new(RwLock::new(HashMap::new()));
     let mut live_histograms = HashMap::new();
 
-    pool.execute("
+    pool.execute(
+        "
     CREATE TABLE IF NOT EXISTS site (
         id INTEGER PRIMARY KEY,
         running_successes INTEGER NOT NULL,
@@ -336,11 +484,17 @@ async fn main() -> Result<()> {
         latency_us INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS req_ts_idx ON req (timestamp);
-    CREATE INDEX IF NOT EXISTS req_ts_idx2 ON req (site, timestamp);").await?;
+    CREATE INDEX IF NOT EXISTS req_ts_idx2 ON req (site, timestamp);",
+    )
+    .await?;
 
     for site in sites.iter() {
         let id = site_to_id(site);
-        let has_ported = sqlx::query("SELECT * FROM site_v2 WHERE id = ?").bind(id).fetch_optional(&*pool).await?.is_some();
+        let has_ported = sqlx::query("SELECT * FROM site_v2 WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&*pool)
+            .await?
+            .is_some();
         if !has_ported {
             let mut histogram = blank_histogram();
             let threshold = get_rolling_threshold(SystemTime::now());
@@ -371,7 +525,7 @@ async fn main() -> Result<()> {
                 url: sites.iter().find(|s| site_to_id(*s) == id).unwrap().clone(),
                 last_latency_us,
                 last_status,
-                histogram
+                histogram,
             };
             write_site(&mut pool.acquire().await?, site).await?;
         }
@@ -385,11 +539,18 @@ async fn main() -> Result<()> {
 
     let live_histograms = Arc::new(live_histograms);
 
-    let app_state = AppState { pool, sites, images, live_histograms };
+    let app_state = AppState {
+        pool,
+        sites,
+        images,
+        live_histograms,
+    };
     let app_state_ = app_state.clone();
     tokio::spawn(async move { do_requests(app_state_).await });
 
-    let app = Router::new().route("/", get(handler)).route("/image/:id", get(image_handler))
+    let app = Router::new()
+        .route("/", get(handler))
+        .route("/image/:id", get(image_handler))
         .with_state(app_state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 7800));
@@ -449,31 +610,53 @@ svg {
 }
 ";
 
-async fn image_handler(Path(id): Path<String>, State(AppState { live_histograms: _, pool: _, sites: _, images }): State<AppState>) -> (StatusCode, Bytes) {
+async fn image_handler(
+    Path(id): Path<String>,
+    State(AppState {
+        live_histograms: _,
+        pool: _,
+        sites: _,
+        images,
+    }): State<AppState>,
+) -> (StatusCode, Bytes) {
     let id = id.split_once(".").unwrap_or((&id, "")).0;
     let id = match u32::from_str(id) {
         Ok(id) => id,
-        Err(_) => return (StatusCode::NOT_FOUND, Bytes::from("Not Found"))
+        Err(_) => return (StatusCode::NOT_FOUND, Bytes::from("Not Found")),
     };
-    match images.read().await.get(&id) { 
+    match images.read().await.get(&id) {
         Some(data) => (StatusCode::OK, Bytes::from(data.clone())),
-        None => (StatusCode::NOT_FOUND, Bytes::from("Not Found"))
+        None => (StatusCode::NOT_FOUND, Bytes::from("Not Found")),
     }
 }
 
 async fn read_site<'a, E: SqliteExecutor<'a>>(conn: E, id: u32) -> Result<Site> {
-    let row = sqlx::query("SELECT data FROM site_v2 WHERE id = ?").bind(id).fetch_one(conn).await?;
+    let row = sqlx::query("SELECT data FROM site_v2 WHERE id = ?")
+        .bind(id)
+        .fetch_one(conn)
+        .await?;
     let row: Vec<u8> = row.get(0);
     let site = rmp_serde::from_slice(&row)?;
     Ok(site)
 }
 
 async fn write_site<'a, E: SqliteExecutor<'a>>(conn: E, data: Site) -> Result<()> {
-    sqlx::query("INSERT OR REPLACE INTO site_v2 VALUES (?, ?)").bind(site_to_id(&data.url)).bind(rmp_serde::to_vec_named(&data).unwrap()).execute(conn).await?;
+    sqlx::query("INSERT OR REPLACE INTO site_v2 VALUES (?, ?)")
+        .bind(site_to_id(&data.url))
+        .bind(rmp_serde::to_vec_named(&data).unwrap())
+        .execute(conn)
+        .await?;
     Ok(())
 }
 
-async fn handler(State(AppState { live_histograms, pool, sites: site_urls, images: _ }): State<AppState>) -> Result<Html<String>, AppError> {
+async fn handler(
+    State(AppState {
+        live_histograms,
+        pool,
+        sites: site_urls,
+        images: _,
+    }): State<AppState>,
+) -> Result<Html<String>, AppError> {
     let mut conn = pool.acquire().await?;
     let mut sites = vec![];
     let mut sites_up = 0;
@@ -485,19 +668,22 @@ async fn handler(State(AppState { live_histograms, pool, sites: site_urls, image
         }
         sites.push(site);
     }
-    Ok(Html(html! {
-        (DOCTYPE)
-        meta charset="utf8";
-        meta http-equiv="refresh" content="60";
-        meta name="viewport" content="width=device-width, initial-scale=1";
-        title { (sites_up) "/" (sites.len()) " up - OnStat" }
-        style { (CSS) }
-        body {
-            h1 .title { "OnStat" }
-            h2 .title { (sites_up) "/" (sites.len()) " up" }
-            @for site in sites {
-                (render_site(site))
+    Ok(Html(
+        html! {
+            (DOCTYPE)
+            meta charset="utf8";
+            meta http-equiv="refresh" content="60";
+            meta name="viewport" content="width=device-width, initial-scale=1";
+            title { (sites_up) "/" (sites.len()) " up - OnStat" }
+            style { (CSS) }
+            body {
+                h1 .title { "OnStat" }
+                h2 .title { (sites_up) "/" (sites.len()) " up" }
+                @for site in sites {
+                    (render_site(site))
+                }
             }
         }
-    }.into_string()))
+        .into_string(),
+    ))
 }
